@@ -1,0 +1,10 @@
+name: jenapps
+title:
+username: jenglance
+account: jenglance
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 16841090
+bundleId: 11678724
+url: https://jenglance.shinyapps.io/jenapps/
+version: 1

@@ -7,11 +7,9 @@ library(dplyr)
 library(pROC)
 library(DT)
 
-# ---- Load model bundle from path----
-#bundle_path <- "C:/JenApps/xgb_model_bundle.rds"
-#model_bundle <- readRDS(bundle_path)
+# ---- Load model bundle (readRDS relative path for app, not direct path)
 model_bundle <- readRDS("xgb_model_bundle.rds")
-
+data <- read.csv("TRXFN_Clean.csv", stringsAsFactors = TRUE)
 
 xgb_model <- model_bundle$model
 roc_obj_train <- model_bundle$roc
