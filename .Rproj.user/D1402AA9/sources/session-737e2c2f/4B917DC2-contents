@@ -1,0 +1,199 @@
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+library(shiny)
+library(caret)
+library(xgboost)
+library(ggplot2)
+library(dplyr)
+library(pROC)
+library(DT)
+
+# ---- Load model bundle from path----
+#bundle_path <- "C:/JenApps/xgb_model_bundle.rds"
+#model_bundle <- readRDS(bundle_path)
+model_bundle <- readRDS("xgb_model_bundle.rds")
+
+
+xgb_model <- model_bundle$model
+roc_obj_train <- model_bundle$roc
+optimal_threshold <- model_bundle$best_threshold
+threshold_metrics <- model_bundle$threshold_metrics
+metrics <- model_bundle$metrics
+factor_levels <- model_bundle$factor_levels
+
+# ---- Extract factor levels for select inputs ----
+indications_levels <- factor_levels$Cesarean.Indications
+
+# ---- Binary choices for UI ----
+binary_choices <- c("No" = "0", "Yes" = "1")
+
+# ---- Risk band function ----
+getRiskBand <- function(prob, threshold, buffer = 0.05) {
+  if (prob >= (threshold + buffer)) {
+    return("High Risk")
+  } else if (prob <= (threshold - buffer)) {
+    return("Low Risk")
+  } else {
+    return("Moderate Risk")
+  }
+}
+
+# === UI ===
+ui <- fluidPage(
+  titlePanel("Transfusion Prediction App (XGBoost)"),
+  
+  tabsetPanel(
+    # --- Clinician tab ---
+    tabPanel("Clinician",
+             sidebarLayout(
+               sidebarPanel(
+                 selectInput("cesarean", "Cesarean Delivery:", choices = binary_choices),
+                 selectInput("induction", "Induction Used:", choices = binary_choices),
+                 selectInput("indications", "Indications:", choices = indications_levels),
+                 actionButton("predictBtn", "Predict"),
+                 hr(),
+                 strong(paste("Optimal cutoff threshold (Youden's J):", round(optimal_threshold, 4))),
+                 br(),
+                 sliderInput("threshold", "Adjust Classification Threshold:", min = 0, max = 1,
+                             value = optimal_threshold, step = 0.01),
+                 sliderInput("buffer", "Moderate Risk Buffer (±):", min = 0, max = 0.1,
+                             value = 0.05, step = 0.01),
+                 hr(),
+                 h4("Prediction Output:"),
+                 verbatimTextOutput("predictionOutput")
+               ),
+               mainPanel(
+                 h4("Feature Importance (by Gain):"),
+                 plotOutput("importancePlot")
+               )
+             )
+    ),
+    
+    # --- Researcher tab ---
+    tabPanel("Researcher",
+             sidebarLayout(
+               sidebarPanel(
+                 fileInput("csvFile", "Upload CSV File", accept = ".csv"),
+                 downloadButton("downloadResults", "Download Predictions"),
+                 hr(),
+                 h4("Classification Threshold"),
+                 sliderInput("threshold", "Adjust Classification Threshold:", min = 0, max = 1,
+                             value = optimal_threshold, step = 0.01),
+                 sliderInput("buffer", "Moderate Risk Buffer (±):", min = 0, max = 0.1,
+                             value = 0.05, step = 0.01)
+               ),
+               mainPanel(
+                 h4("ROC Curve & AUC"),
+                 plotOutput("rocPlot"),
+                 verbatimTextOutput("aucOutput"),
+                 hr(),
+                 h4("Uploaded Data Predictions"),
+                 DTOutput("uploadedPreds")
+               )
+             )
+    )
+  )
+)
+
+# === Server ===
+server <- function(input, output, session) {
+  
+  # --- Update indications choices dynamically ---
+  observe({
+    req(input$cesarean)
+    choices <- indications_levels
+    if (input$cesarean == "1") {
+      choices <- setdiff(choices, "Vaginal")
+    } else {
+      if (!("Vaginal" %in% choices)) choices <- c("Vaginal", choices)
+    }
+    
+    selected_val <- input$indications
+    if (is.null(selected_val) || !(selected_val %in% choices) || input$cesarean == "0") {
+      selected_val <- "Vaginal"
+    }
+    
+    updateSelectInput(session, "indications", choices = choices, selected = selected_val)
+  })
+  
+  # --- Clinician predictions ---
+  observeEvent(input$predictBtn, {
+    tryCatch({
+      new_data <- data.frame(
+        CesareanDelivery = as.numeric(input$cesarean),
+        InductionUsed = as.numeric(input$induction),
+        Cesarean.Indications = factor(input$indications, levels = indications_levels),
+        id = 9999
+      )
+      
+      new_data <- new_data[, names(xgb_model$trainingData)[names(xgb_model$trainingData) != ".outcome"]]
+      pred_prob <- predict(xgb_model, newdata = new_data, type = "prob")
+      prob_yes <- pred_prob[,"yes"]
+      
+      pred_class <- factor(ifelse(prob_yes >= input$threshold, "yes", "no"), levels = c("no","yes"))
+      risk_band <- getRiskBand(prob_yes, input$threshold, buffer = input$buffer)
+      
+      output$predictionOutput <- renderPrint({
+        cat("Predicted Class:", as.character(pred_class), "\n")
+        cat("Probability of Requiring a Transfusion:", round(prob_yes, 4), "\n")
+        cat("Risk Band:", risk_band, "\n")
+        cat("Classification threshold used:", round(input$threshold, 4), "\n")
+        cat("Moderate Risk buffer (±):", round(input$buffer, 4))
+      })
+    }, error = function(e) {
+      output$predictionOutput <- renderPrint({cat("Error in prediction:\n", e$message)})
+    })
+  })
+  
+  # --- Feature importance plot ---
+  output$importancePlot <- renderPlot({
+    importance <- xgb.importance(model = xgb_model$finalModel) %>% filter(Feature != "id")
+    ggplot(importance, aes(x = reorder(Feature, Gain), y = Gain)) +
+      geom_bar(stat = "identity", fill = "pink") +
+      coord_flip() +
+      labs(title = "Feature Importance (by Gain)", x = "Feature", y = "Gain") +
+      theme_minimal()
+  })
+  
+  # --- ROC plot ---
+  output$rocPlot <- renderPlot({
+    if (!is.null(input$csvFile)) {
+      df <- read.csv(input$csvFile$datapath)
+      if ("churn" %in% colnames(df) && "Probability_Yes" %in% colnames(df)) {
+        roc_obj <- pROC::roc(df$churn, df$Probability_Yes)
+        plot.roc(roc_obj, col="darkblue", main="ROC Curve (Uploaded Data)", print.auc=TRUE)
+      } else {
+        plot.new(); text(0.5,0.5,"CSV must contain 'churn' and 'Probability_Yes'")
+      }
+    } else {
+      plot.roc(roc_obj_train, col="darkblue", main="ROC Curve (Training CV Predictions)", print.auc=TRUE)
+    }
+  })
+  
+  # --- AUC text ---
+  output$aucOutput <- renderPrint({
+    if (!is.null(input$csvFile)) {
+      df <- read.csv(input$csvFile$datapath)
+      if ("churn" %in% colnames(df) && "Probability_Yes" %in% colnames(df)) {
+        roc_obj <- pROC::roc(df$churn, df$Probability_Yes)
+        cat("AUC (Uploaded Data):", round(pROC::auc(roc_obj),4))
+      } else {
+        cat("AUC: Cannot calculate (missing columns)")
+      }
+    } else {
+      cat("AUC (Training CV):", round(pROC::auc(roc_obj_train),4))
+    }
+  })
+  
+  # --- Optional: uploaded predictions table ---
+  output$uploadedPreds <- renderDT({
+    req(input$csvFile)
+    df <- read.csv(input$csvFile$datapath)
+    if ("Probability_Yes" %in% colnames(df)) {
+      datatable(df)
+    }
+  })
+  
+}
+
+# === Run app ===
+shinyApp(ui = ui, server = server)
